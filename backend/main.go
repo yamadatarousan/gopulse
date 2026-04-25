@@ -16,9 +16,78 @@ type Result struct {
 	ErrorMessage string `json:"error,omitempty"` // エラーがない時は省略される
 }
 
+// 監視対象を管理する構造体
+type Monitor struct {
+	urls []string
+	mu   sync.RWMutex // 読み書きを安全に行うための鍵
+}
+
+// グローバル変数としてインスタンス化
+var monitor = &Monitor{
+	urls: []string{"https://go.dev", "https://google.com"},
+}
+
+// URLを追加するメソッド
+func (m *Monitor) Add(url string) {
+	m.mu.Lock()         // muに対してロックをかける
+	defer m.mu.Unlock() // 関数が終わったらアンロック
+	m.urls = append(m.urls, url)
+}
+
+func (m *Monitor) Remove(target string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	newUrls := []string{}
+	for _, u := range m.urls {
+		if u != target {
+			newUrls = append(newUrls, u)
+		}
+	}
+	m.urls = newUrls
+}
+
+func (m *Monitor) GetURLs() []string {
+	m.mu.RLock() // 読み取り専用ロック
+	defer m.mu.RUnlock()
+	return append([]string{}, m.urls...)
+}
+
 func main() {
 	// "/stream" というURLにアクセスが来たら、streamHandler関数を実行する
 	http.HandleFunc("/stream", streamHandler)
+
+	// --- ここを追加: フロントエンドから Add/Remove を呼べるようにする ---
+	http.HandleFunc("/urls", func(w http.ResponseWriter, r *http.Request) {
+		// CORS対策
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == http.MethodOptions {
+			return
+		}
+
+		switch r.Method {
+		case http.MethodPost:
+			var payload struct {
+				URL string `json:"url"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			monitor.Add(payload.URL)
+			fmt.Println("URLを追加しました:", payload.URL)
+			w.WriteHeader(http.StatusCreated)
+		case http.MethodDelete:
+			url := r.URL.Query().Get("url")
+			if url != "" {
+				monitor.Remove(url)
+				fmt.Println("URLを削除しました:", url)
+				w.WriteHeader(http.StatusOK)
+			}
+		}
+	})
 
 	fmt.Println("サーバーを起動しました: http://localhost:8080")
 	// 8080ポートでサーバーを立ち上げて待機
@@ -33,15 +102,8 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	// 2. SSE用のヘッダー: 「これは途切れないデータのストリームですよ」とブラウザに伝える
 	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-chache")
+	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-
-	urls := []string{
-		"https://www.google.com",
-		"https://www.github.com",
-		"https://go.dev",
-		"https://非実在のサイト.com",
-	}
 
 	// 5秒ごとに動く時計（Ticker）を作成
 	ticker := time.NewTicker(5 * time.Second)
@@ -59,6 +121,8 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 			fmt.Println("クライアントが切断されました")
 			return
 		case <-ticker.C: // 5秒経過するごとにここが実行される
+			// 毎回最新のリストを取得する
+			urls := monitor.GetURLs()
 
 			// --- ここから下は先ほど学んだ並行処理 ---
 			resultsChan := make(chan Result, len(urls))
@@ -90,7 +154,7 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 					flusher.Flush()
 				}
 			}
-			fmt.Println("1ターン分のチェック結果を送信しました")
+			fmt.Println("チェック完了。対象数:", len(urls))
 		}
 	}
 }
