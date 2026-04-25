@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -22,9 +23,55 @@ type Monitor struct {
 	mu   sync.RWMutex // 読み書きを安全に行うための鍵
 }
 
+// データを保存するファイル名
+const dataFile = "urls.json"
+
 // グローバル変数としてインスタンス化
 var monitor = &Monitor{
-	urls: []string{"https://go.dev", "https://google.com"},
+	urls: []string{},
+}
+
+// === 新機能: ファイルからURLリストを読み込む ===
+func (m *Monitor) Load() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// 1. ファイルを読み込む
+	data, err := os.ReadFile(dataFile)
+	if err != nil {
+		// ファイルが存在しない場合は、デフォルト値を入れてファイルを作成する
+		if os.IsNotExist(err) {
+			fmt.Println("urls.json が見つからないため、新規作成します。")
+			m.urls = []string{"https://go.dev", "https://google.com"}
+			m.saveToFile() // ファイルに書き出す
+			return
+		}
+		fmt.Println("ファイル読み込みエラー:", err)
+		return
+	}
+
+	// 2. 読み込んだJSONデータ(バイト配列)をスライスに変換する
+	if err := json.Unmarshal(data, &m.urls); err != nil {
+		fmt.Println("JSONパースエラー:", err)
+	} else {
+		fmt.Println("ファイルからURLリストを読み込みました:", m.urls)
+	}
+}
+
+// === 新機能: 現在のURLリストをファイルに保存する (内部用) ===
+// ※注意: この関数を呼ぶときは、すでにLockがかかっている前提とします
+func (m *Monitor) saveToFile() {
+	// スライスをきれいなJSON文字列に変換
+	data, err := json.MarshalIndent(m.urls, "", "  ")
+	if err != nil {
+		fmt.Println("JSON変換エラー:", err)
+		return
+	}
+
+	// ファイルに書き込む (0644は一般的なファイルの権限)
+	if err := os.WriteFile(dataFile, data, 0644); err != nil {
+		fmt.Println("ファイル書き込みエラー:", err)
+	}
 }
 
 // URLを追加するメソッド
@@ -32,6 +79,7 @@ func (m *Monitor) Add(url string) {
 	m.mu.Lock()         // muに対してロックをかける
 	defer m.mu.Unlock() // 関数が終わったらアンロック
 	m.urls = append(m.urls, url)
+	m.saveToFile()
 }
 
 func (m *Monitor) Remove(target string) {
@@ -44,6 +92,7 @@ func (m *Monitor) Remove(target string) {
 		}
 	}
 	m.urls = newUrls
+	m.saveToFile()
 }
 
 func (m *Monitor) GetURLs() []string {
@@ -53,6 +102,9 @@ func (m *Monitor) GetURLs() []string {
 }
 
 func main() {
+	// === ここを追加: サーバー起動前にファイルを読み込む ===
+	monitor.Load()
+
 	// "/stream" というURLにアクセスが来たら、streamHandler関数を実行する
 	http.HandleFunc("/stream", streamHandler)
 
