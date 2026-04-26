@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/joho/godotenv"
 	"net/http"
 	"os"
 	"sync"
@@ -21,6 +23,8 @@ type Result struct {
 type Monitor struct {
 	urls []string
 	mu   sync.RWMutex // 読み書きを安全に行うための鍵
+	// 各URLの「前回落ちていたか」を記録する (true = 落ちている)
+	isDown map[string]bool
 }
 
 // データを保存するファイル名
@@ -28,7 +32,8 @@ const dataFile = "urls.json"
 
 // グローバル変数としてインスタンス化
 var monitor = &Monitor{
-	urls: []string{},
+	urls:   []string{},
+	isDown: make(map[string]bool),
 }
 
 // === 新機能: ファイルからURLリストを読み込む ===
@@ -102,6 +107,11 @@ func (m *Monitor) GetURLs() []string {
 }
 
 func main() {
+	// .envの読み込み
+	if err := godotenv.Load(); err != nil {
+		fmt.Println(".envファイルが見つかりません。環境変数から直接読み込みます。")
+	}
+
 	// === ここを追加: サーバー起動前にファイルを読み込む ===
 	monitor.Load()
 
@@ -212,6 +222,24 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 
 			// --- ここから下で、受け取った結果をフロントエンドに送信 ---
 			for res := range resultsChan {
+				// 1. 現在の判定
+				isCurrentlyDown := res.Status != 200 || res.ErrorMessage != ""
+
+				monitor.mu.Lock()
+				wasDown := monitor.isDown[res.URL]
+
+				// 2. 状態の変化をチェック
+				if isCurrentlyDown && !wasDown {
+					// 正常 -> 異常
+					go sendDiscordNotification("🚨 【障害発生】 " + res.URL + " がダウンしました！")
+					monitor.isDown[res.URL] = true
+				} else if !isCurrentlyDown && wasDown {
+					// 異常 -> 正常
+					go sendDiscordNotification("✅ 【復旧】 " + res.URL + " が回復しました。")
+					monitor.isDown[res.URL] = false
+				}
+				monitor.mu.Unlock()
+
 				// 構造体をJSON文字列に変換
 				data, _ := json.Marshal(res)
 
@@ -246,4 +274,22 @@ func checkStatus(url string) Result {
 	defer resp.Body.Close()
 
 	return Result{URL: url, Status: resp.StatusCode, Latency: elapsed}
+}
+
+func sendDiscordNotification(message string) {
+	url := os.Getenv("DISCORD_WEBHOOK_URL")
+	if url == "" {
+		fmt.Println("通知エラー: Webhook URLが設定されていません")
+		return
+	}
+
+	payload := map[string]string{"content": message}
+	data, _ := json.Marshal(payload)
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
+	if err != nil {
+		fmt.Println("Discord送信失敗:", err)
+		return
+	}
+	defer resp.Body.Close()
 }
