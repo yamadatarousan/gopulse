@@ -175,18 +175,35 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 		case <-ticker.C: // 5秒経過するごとにここが実行される
 			// 毎回最新のリストを取得する
 			urls := monitor.GetURLs()
+			numJobs := len(urls)
+			if numJobs == 0 {
+				continue
+			}
 
-			// --- ここから下は先ほど学んだ並行処理 ---
-			resultsChan := make(chan Result, len(urls))
+			// 1. チャネルの準備
+			jobs := make(chan string, numJobs)        // 仕事(URL)を入れる箱
+			resultsChan := make(chan Result, numJobs) // 結果を入れる箱
+
+			// 2. ワーカーを起動する
+			const workerCount = 3
 			var wg sync.WaitGroup
 
-			for _, url := range urls {
+			for i := 0; i < workerCount; i++ {
 				wg.Add(1)
-				go func(u string) {
+				go func() {
 					defer wg.Done()
-					resultsChan <- checkStatus(u)
-				}(url)
+					// jobsチャネルからURLが送られてくるのを待機し、届いたら処理する
+					for url := range jobs {
+						resultsChan <- checkStatus(url)
+					}
+				}()
 			}
+
+			// 3. 仕事（URL）をチャネルに投入する
+			for _, url := range urls {
+				jobs <- url
+			}
+			close(jobs) // 「もう仕事はないよ」とワーカーに伝える（これでrangeが終了する）
 
 			go func() {
 				wg.Wait()
