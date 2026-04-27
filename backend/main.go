@@ -25,6 +25,8 @@ type Monitor struct {
 	mu   sync.RWMutex // 読み書きを安全に行うための鍵
 	// 各URLの「前回落ちていたか」を記録する (true = 落ちている)
 	isDown map[string]bool
+	// 追加：連続失敗回数を記録するマップ
+	failCounts map[string]int
 }
 
 // データを保存するファイル名
@@ -32,8 +34,9 @@ const dataFile = "urls.json"
 
 // グローバル変数としてインスタンス化
 var monitor = &Monitor{
-	urls:   []string{},
-	isDown: make(map[string]bool),
+	urls:       []string{},
+	isDown:     make(map[string]bool),
+	failCounts: make(map[string]int), // 初期化
 }
 
 // === 新機能: ファイルからURLリストを読み込む ===
@@ -222,21 +225,31 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 
 			// --- ここから下で、受け取った結果をフロントエンドに送信 ---
 			for res := range resultsChan {
-				// 1. 現在の判定
-				isCurrentlyDown := res.Status != 200 || res.ErrorMessage != ""
+				// 1. 【ここを修正】何をもって「今回のチェックが失敗」とするか
+				// エラーメッセージがある、もしくはステータスコードが400以上（リダイレクト3xxは許容）
+				isCheckFailed := res.ErrorMessage != "" || (res.Status >= 400)
 
 				monitor.mu.Lock()
 				wasDown := monitor.isDown[res.URL]
 
-				// 2. 状態の変化をチェック
-				if isCurrentlyDown && !wasDown {
-					// 正常 -> 異常
-					go sendDiscordNotification("🚨 【障害発生】 " + res.URL + " がダウンしました！")
-					monitor.isDown[res.URL] = true
-				} else if !isCurrentlyDown && wasDown {
-					// 異常 -> 正常
-					go sendDiscordNotification("✅ 【復旧】 " + res.URL + " が回復しました。")
-					monitor.isDown[res.URL] = false
+				if isCheckFailed {
+					// 失敗した場合：カウントを増やす
+					monitor.failCounts[res.URL]++
+					currentFailCount := monitor.failCounts[res.URL]
+
+					// 3回連続失敗して初めて「ダウン状態」とみなす
+					if currentFailCount >= 3 && !wasDown {
+						go sendDiscordNotification("🚨 【障害確定】 " + res.URL + " が3回連続で失敗しました。")
+						monitor.isDown[res.URL] = true
+					}
+				} else {
+					// 成功した場合（200 OK や 301 Redirect など）
+					if wasDown {
+						go sendDiscordNotification("✅ 【復旧】 " + res.URL + " が回復しました。")
+						monitor.isDown[res.URL] = false
+					}
+					// カウントをリセット
+					monitor.failCounts[res.URL] = 0
 				}
 				monitor.mu.Unlock()
 
@@ -262,13 +275,21 @@ func checkStatus(url string) Result {
 
 	// タイムアウト設定付きのクライアント
 	client := http.Client{
-		Timeout: 3 * time.Second,
+		Timeout: 10 * time.Second, // 余裕を持たせる
 	}
 
-	resp, err := client.Get(url)
+	// 1. リクエストオブジェクトを作成
+	req, _ := http.NewRequest("GET", url, nil)
+
+	// 2. 「人間がブラウザで見ていますよ」というフリをする (User-Agent)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	resp, err := client.Do(req)
 	elapsed := time.Since(start).Milliseconds()
 
 	if err != nil {
+		// ここでエラー内容を詳しくログに出すと原因がわかります
+		fmt.Printf("❌ ネットワークエラー: %v\n", err)
 		return Result{URL: url, ErrorMessage: err.Error(), Latency: elapsed}
 	}
 	defer resp.Body.Close()
