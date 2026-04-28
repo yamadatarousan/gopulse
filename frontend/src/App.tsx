@@ -77,8 +77,8 @@ function App() {
   };
 
   const getStatusColor = (res: Result) => {
-    if (res.status === 0) return '#f7fafc'; // 未チェック
-    if (res.error || res.status >= 400) return '#fff5f5'; // エラー
+    if (res.status === 0 && !res.error) return '#f7fafc'; // 未チェック
+    if (res.error || res.status === -1 || res.status >= 400) return '#fff5f5'; // エラー
     if (res.status >= 300) return '#fffaf0'; // リダイレクト
     return '#f0fff4'; // 正常
   }
@@ -113,15 +113,17 @@ function App() {
             }}>🗑️</button>
 
             <h3 style={{ margin: '0 0 10px 0', fontSize: '1rem', overflowWrap: 'anywhere' }}>{res.url}</h3>
-            {res.status === 0? (
+            {res.status === 0 && !res.error ? (
               <p style={{ color: '#718096', margin: 0 }}>チェック待機中...</p>
-            ) : res.error? (
-              <p style={{ color: '#e53e3e', margin: 0, fontSize: '0.9rem' }}>{res.error}</p>
+            ) : res.error ? (
+              <p style={{ color: '#e53e3e', margin: 0, fontSize: '0.9rem' }}>
+                {res.status === -1 ? '接続失敗' : 'エラー'}: {res.error}
+              </p>
             ) : (
               <div>
                 <span style={{
                   padding: '4px 8px', borderRadius: '4px',
-                  backgroundColor: res.status < 400? '#c6f6d5' : '#fed7d7',
+                  backgroundColor: res.status < 400 ? '#c6f6d5' : '#fed7d7',
                   fontSize: '0.8rem', fontWeight: 'bold'
                 }}>{res.status}</span>
                 <span style={{ marginLeft: '10px', color: '#666', fontSize: '0.9rem' }}>

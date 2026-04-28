@@ -261,6 +261,14 @@ func urlsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		monitor.Add(payload.URL)
 		fmt.Println("URLを追加しました:", payload.URL)
+
+		// 追加: 即座に1回チェックしてbroadcastする
+		go func(url string) {
+			res := checkStatus(url)
+			handleResult(res)
+			broadcast(res)
+		}(payload.URL)
+
 		w.WriteHeader(http.StatusCreated)
 
 	case http.MethodDelete:
@@ -420,26 +428,39 @@ func checkStatus(url string) Result {
 
 	// タイムアウト設定付きのクライアント
 	client := http.Client{
-		Timeout: 10 * time.Second, // 余裕を持たせる
+		Timeout: 10 * time.Second, // 余裕を持たせる,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("リダイレクトが多すぎます")
+			}
+			return nil
+		},
 	}
 
 	// 1. リクエストオブジェクトを作成
 	req, _ := http.NewRequest("GET", url, nil)
-
-	// 2. 「人間がブラウザで見ていますよ」というフリをする (User-Agent)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", "GoPulse/1.0")
 
 	resp, err := client.Do(req)
 	elapsed := time.Since(start).Milliseconds()
 
+	res := Result{
+		URL:       url,
+		Latency:   elapsed,
+		CheckedAt: time.Now().Unix(),
+		Status:    0, // デフォルト
+	}
+
 	if err != nil {
 		// ここでエラー内容を詳しくログに出すと原因がわかります
 		fmt.Printf("❌ ネットワークエラー: %v\n", err)
-		return Result{URL: url, ErrorMessage: err.Error(), Latency: elapsed}
+		res.ErrorMessage = err.Error()
+		res.Status = -1 // エラー時は-1にする。0と区別
+		return res
 	}
 	defer resp.Body.Close()
-
-	return Result{URL: url, Status: resp.StatusCode, Latency: elapsed}
+	res.Status = resp.StatusCode
+	return res
 }
 
 func sendDiscordNotification(message string) {
