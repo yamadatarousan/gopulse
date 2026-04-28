@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/joho/godotenv"
@@ -17,6 +18,7 @@ type Result struct {
 	Status       int    `json:"status"`
 	Latency      int64  `json:"latency"`         // ミリ秒
 	ErrorMessage string `json:"error,omitempty"` // エラーがない時は省略される
+	CheckedAt    int64  `json:"checked_at"`      // 追加: いつの結果か分かるように
 }
 
 // 監視対象を管理する構造体
@@ -37,6 +39,112 @@ var monitor = &Monitor{
 	urls:       []string{},
 	isDown:     make(map[string]bool),
 	failCounts: make(map[string]int), // 初期化
+}
+
+// ===== SSE購読管理: ここをちゃんと使う =====
+var subscribers = make(map[chan Result]struct{})
+var subMu sync.Mutex
+
+func subscribe() chan Result {
+	ch := make(chan Result, 20) // バッファ少し増やす
+	subMu.Lock()
+	subscribers[ch] = struct{}{}
+	subMu.Unlock()
+	return ch
+}
+
+func unsubscribe(ch chan Result) {
+	subMu.Lock()
+	delete(subscribers, ch)
+	close(ch)
+	subMu.Unlock()
+}
+
+func broadcast(res Result) {
+	subMu.Lock()
+	defer subMu.Unlock()
+	for ch := range subscribers {
+		select {
+		case ch <- res: // 送れるなら送る
+		default: // 詰まってるクライアントは諦める。遅延防止
+		}
+	}
+}
+
+// === 監視ループを分離: サーバー起動時に1個だけ走らせる ===
+func startMonitoringLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	fmt.Println("バックグラウンド監視ループ開始")
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("監視ループ停止")
+			return
+		case <-ticker.C:
+			urls := monitor.GetURLs()
+			if len(urls) == 0 {
+				continue
+			}
+
+			// worker poolは毎回作らず使い回した方が良いが、まず動く版
+			var wg sync.WaitGroup
+			resultCh := make(chan Result, len(urls))
+
+			const workerCount = 5
+			jobs := make(chan string, len(urls))
+
+			for i := 0; i < workerCount; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for url := range jobs {
+						resultCh <- checkStatus(url)
+					}
+				}()
+			}
+
+			for _, url := range urls {
+				jobs <- url
+			}
+			close(jobs)
+
+			go func() {
+				wg.Wait()
+				close(resultCh)
+			}()
+
+			for res := range resultCh {
+				handleResult(res) // 通知ロジックを分離
+				broadcast(res)    // 全クライアントに配信
+			}
+		}
+	}
+}
+
+func handleResult(res Result) {
+	isFailed := res.ErrorMessage != "" || (res.Status >= 400)
+
+	monitor.mu.Lock()
+	defer monitor.mu.Unlock()
+
+	wasDown := monitor.isDown[res.URL]
+
+	if isFailed {
+		monitor.failCounts[res.URL]++
+		if monitor.failCounts[res.URL] >= 3 && !wasDown {
+			go sendDiscordNotification("🚨 【障害確定】 " + res.URL + " が3回連続で失敗しました。Status: " + fmt.Sprintf("%d", res.Status))
+			monitor.isDown[res.URL] = true
+		}
+	} else {
+		if wasDown {
+			go sendDiscordNotification("✅ 【復旧】 " + res.URL + " が回復しました。")
+			monitor.isDown[res.URL] = false
+		}
+		monitor.failCounts[res.URL] = 0
+	}
 }
 
 // === 新機能: ファイルからURLリストを読み込む ===
@@ -110,54 +218,91 @@ func (m *Monitor) GetURLs() []string {
 }
 
 func main() {
-	// .envの読み込み
-	if err := godotenv.Load(); err != nil {
-		fmt.Println(".envファイルが見つかりません。環境変数から直接読み込みます。")
-	}
-
-	// === ここを追加: サーバー起動前にファイルを読み込む ===
+	_ = godotenv.Load()
 	monitor.Load()
 
-	// "/stream" というURLにアクセスが来たら、streamHandler関数を実行する
+	// 1. バックグラウンド監視を開始
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go startMonitoringLoop(ctx)
+
 	http.HandleFunc("/stream", streamHandler)
-
-	// --- ここを追加: フロントエンドから Add/Remove を呼べるようにする ---
-	http.HandleFunc("/urls", func(w http.ResponseWriter, r *http.Request) {
-		// CORS対策
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-		if r.Method == http.MethodOptions {
-			return
-		}
-
-		switch r.Method {
-		case http.MethodPost:
-			var payload struct {
-				URL string `json:"url"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			monitor.Add(payload.URL)
-			fmt.Println("URLを追加しました:", payload.URL)
-			w.WriteHeader(http.StatusCreated)
-		case http.MethodDelete:
-			url := r.URL.Query().Get("url")
-			if url != "" {
-				monitor.Remove(url)
-				fmt.Println("URLを削除しました:", url)
-				w.WriteHeader(http.StatusOK)
-			}
-		}
-	})
+	http.HandleFunc("/urls", urlsHandler)
+	http.HandleFunc("/status", statusHandler)
 
 	fmt.Println("サーバーを起動しました: http://localhost:8080")
-	// 8080ポートでサーバーを立ち上げて待機
 	if err := http.ListenAndServe(":8080", nil); err != nil {
-		fmt.Println("サーバーエラー:", err)
+		fmt.Println("サーバーエラー;", err)
+	}
+}
+
+func urlsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPost:
+		var payload struct {
+			URL string `json:"url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if payload.URL == "" {
+			http.Error(w, "url is required", http.StatusBadRequest)
+			return
+		}
+		monitor.Add(payload.URL)
+		fmt.Println("URLを追加しました:", payload.URL)
+		w.WriteHeader(http.StatusCreated)
+
+	case http.MethodDelete:
+		url := r.URL.Query().Get("url")
+		if url == "" {
+			http.Error(w, "url query param is required", http.StatusBadRequest)
+			return
+		}
+		monitor.Remove(url)
+		fmt.Println("URLを削除しました:", url)
+		w.WriteHeader(http.StatusOK)
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// 初回レンダリング用: 現在の全URLの状態を返す
+func statusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	urls := monitor.GetURLs()
+
+	// 今はまだチェック結果が無いので、ダミーデータを返す
+	dummy := make([]Result, 0, len(urls))
+	for _, u := range urls {
+		dummy = append(dummy, Result{
+			URL:     u,
+			Status:  0, // 0 = 未チェック扱い
+			Latency: 0,
+		})
+	}
+
+	if err := json.NewEncoder(w).Encode(dummy); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 }
 
