@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/joho/godotenv"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 	"net/http"
 	"os"
 	"sync"
@@ -21,24 +23,136 @@ type Result struct {
 	CheckedAt    int64  `json:"checked_at"`      // 追加: いつの結果か分かるように
 }
 
-// 監視対象を管理する構造体
-type Monitor struct {
-	urls []string
-	mu   sync.RWMutex // 読み書きを安全に行うための鍵
-	// 各URLの「前回落ちていたか」を記録する (true = 落ちている)
-	isDown map[string]bool
-	// 追加：連続失敗回数を記録するマップ
-	failCounts map[string]int
+// === DBモデル追加 ===
+type URLStatus struct {
+	ID          uint      `gorm:"primaryKey" json:"-"`
+	URL         string    `gorm:"uniqueIndex" json:"url"`
+	IsDown      bool      `json:"is_down"`
+	FailCount   int       `json:"fail_count"`
+	LastStatus  int       `json:"last_status"`
+	LastLatency int64     `json:"last_latency"`
+	LastError   string    `json:"last_error"`
+	LastCheck   int64     `json:"last_check"`
+	CreatedAt   time.Time `json:"-"`
+	UpdatedAt   time.Time `json:"-"`
 }
 
-// データを保存するファイル名
-const dataFile = "urls.json"
+type CheckHistory struct {
+	ID        uint   `gorm:"primaryKey" json:"-"`
+	URL       string `gorm:"index" json:"url"`
+	Status    int    `json:"status"`
+	Latency   int64  `json:"latency"`
+	ErrorMsg  string `json:"error"`
+	CheckedAt int64  `gorm:"index" json:"checked_at"`
+}
 
-// グローバル変数としてインスタンス化
-var monitor = &Monitor{
-	urls:       []string{},
-	isDown:     make(map[string]bool),
-	failCounts: make(map[string]int), // 初期化
+var db *gorm.DB
+
+// === MonitorはDB操作のラッパーにする ===
+type Monitor struct{}
+
+var monitor = &Monitor{}
+
+// DB初期化
+func initDB() {
+	var err error
+	db, err = gorm.Open(sqlite.Open("gopulse.db"), &gorm.Config{})
+	if err != nil {
+		panic("failed to connect database")
+	}
+	// テーブル自動作成
+	db.AutoMigrate(&URLStatus{}, &CheckHistory{})
+
+	// 初回起動時にデフォルトURL入れる
+	var count int64
+	db.Model(&URLStatus{}).Count(&count)
+	if count == 0 {
+		db.Create(&URLStatus{URL: "https://go.dev"})
+		db.Create(&URLStatus{URL: "https://google.com"})
+		fmt.Println("デフォルトURLをDBに作成しました")
+	}
+}
+
+// URL追加
+func (m *Monitor) Add(url string) error {
+	result := db.Create(&URLStatus{URL: url})
+	return result.Error
+}
+
+// URL削除
+func (m *Monitor) Remove(url string) error {
+	return db.Where("url =?", url).Delete(&URLStatus{}).Error
+}
+
+func (m *Monitor) GetURLs() []string {
+	var statuses []URLStatus
+	db.Find(&statuses)
+	urls := make([]string, len(statuses))
+	for i, s := range statuses {
+		urls[i] = s.URL
+	}
+	return urls
+}
+
+// 全URLの最新状態取得
+func (m *Monitor) GetAllStatus() []URLStatus {
+	var statuses []URLStatus
+	db.Find(&statuses)
+	return statuses
+}
+
+// チェック結果を更新
+func (m *Monitor) UpdateResult(res Result) {
+	var status URLStatus
+	db.Where("url =?", res.URL).First(&status)
+
+	wasDown := status.IsDown
+	isFailed := res.ErrorMessage != "" || (res.Status >= 400)
+
+	if isFailed {
+		status.FailCount++
+		if status.FailCount >= 3 && !wasDown {
+			go sendDiscordNotification("🚨 " + res.URL + " が3回連続で失敗しました。Status: " + fmt.Sprintf("%d", res.Status))
+			status.IsDown = true
+		}
+	} else {
+		if wasDown {
+			go sendDiscordNotification("✅ " + res.URL + " が回復しました。")
+			status.IsDown = false
+		}
+		status.FailCount = 0
+	}
+
+	status.LastStatus = res.Status
+	status.LastLatency = res.Latency
+	status.LastError = res.ErrorMessage
+	status.LastCheck = res.CheckedAt
+	db.Save(&status)
+
+	// チェック履歴も保存する
+	db.Create(&CheckHistory{
+		URL:       res.URL,
+		Status:    res.Status,
+		Latency:   res.Latency,
+		ErrorMsg:  res.ErrorMessage,
+		CheckedAt: res.CheckedAt,
+	})
+}
+
+// CORSミドルウェア
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // ===== SSE購読管理: ここをちゃんと使う =====
@@ -117,135 +231,99 @@ func startMonitoringLoop(ctx context.Context) {
 			}()
 
 			for res := range resultCh {
-				handleResult(res) // 通知ロジックを分離
-				broadcast(res)    // 全クライアントに配信
+				monitor.UpdateResult(res) // 通知ロジックを分離
+				broadcast(res)            // 全クライアントに配信
 			}
 		}
 	}
 }
 
-func handleResult(res Result) {
-	isFailed := res.ErrorMessage != "" || (res.Status >= 400)
-
-	monitor.mu.Lock()
-	defer monitor.mu.Unlock()
-
-	wasDown := monitor.isDown[res.URL]
-
-	if isFailed {
-		monitor.failCounts[res.URL]++
-		if monitor.failCounts[res.URL] >= 3 && !wasDown {
-			go sendDiscordNotification("🚨 【障害確定】 " + res.URL + " が3回連続で失敗しました。Status: " + fmt.Sprintf("%d", res.Status))
-			monitor.isDown[res.URL] = true
-		}
-	} else {
-		if wasDown {
-			go sendDiscordNotification("✅ 【復旧】 " + res.URL + " が回復しました。")
-			monitor.isDown[res.URL] = false
-		}
-		monitor.failCounts[res.URL] = 0
-	}
-}
-
-// === 新機能: ファイルからURLリストを読み込む ===
-func (m *Monitor) Load() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// 1. ファイルを読み込む
-	data, err := os.ReadFile(dataFile)
-	if err != nil {
-		// ファイルが存在しない場合は、デフォルト値を入れてファイルを作成する
-		if os.IsNotExist(err) {
-			fmt.Println("urls.json が見つからないため、新規作成します。")
-			m.urls = []string{"https://go.dev", "https://google.com"}
-			m.saveToFile() // ファイルに書き出す
-			return
-		}
-		fmt.Println("ファイル読み込みエラー:", err)
-		return
-	}
-
-	// 2. 読み込んだJSONデータ(バイト配列)をスライスに変換する
-	if err := json.Unmarshal(data, &m.urls); err != nil {
-		fmt.Println("JSONパースエラー:", err)
-	} else {
-		fmt.Println("ファイルからURLリストを読み込みました:", m.urls)
-	}
-}
-
-// === 新機能: 現在のURLリストをファイルに保存する (内部用) ===
-// ※注意: この関数を呼ぶときは、すでにLockがかかっている前提とします
-func (m *Monitor) saveToFile() {
-	// スライスをきれいなJSON文字列に変換
-	data, err := json.MarshalIndent(m.urls, "", "  ")
-	if err != nil {
-		fmt.Println("JSON変換エラー:", err)
-		return
-	}
-
-	// ファイルに書き込む (0644は一般的なファイルの権限)
-	if err := os.WriteFile(dataFile, data, 0644); err != nil {
-		fmt.Println("ファイル書き込みエラー:", err)
-	}
-}
-
-// URLを追加するメソッド
-func (m *Monitor) Add(url string) {
-	m.mu.Lock()         // muに対してロックをかける
-	defer m.mu.Unlock() // 関数が終わったらアンロック
-	m.urls = append(m.urls, url)
-	m.saveToFile()
-}
-
-func (m *Monitor) Remove(target string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	newUrls := []string{}
-	for _, u := range m.urls {
-		if u != target {
-			newUrls = append(newUrls, u)
-		}
-	}
-	m.urls = newUrls
-	m.saveToFile()
-}
-
-func (m *Monitor) GetURLs() []string {
-	m.mu.RLock() // 読み取り専用ロック
-	defer m.mu.RUnlock()
-	return append([]string{}, m.urls...)
-}
-
 func main() {
 	_ = godotenv.Load()
-	monitor.Load()
+	initDB() // ← ファイル読み込みの代わり
 
 	// 1. バックグラウンド監視を開始
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go startMonitoringLoop(ctx)
 
-	http.HandleFunc("/stream", streamHandler)
-	http.HandleFunc("/urls", urlsHandler)
-	http.HandleFunc("/status", statusHandler)
+	// ServeMuxでルーティング定義してミドルウェアでラップ
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stream", streamHandler)
+	mux.HandleFunc("/urls", urlsHandler)
+	mux.HandleFunc("/status", statusHandler)
+	mux.HandleFunc("/history", historyHandler) // 追加: グラフ用
+
+	handler := corsMiddleware(mux)
 
 	fmt.Println("サーバーを起動しました: http://localhost:8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	if err := http.ListenAndServe(":8080", handler); err != nil {
 		fmt.Println("サーバーエラー;", err)
 	}
 }
 
-func urlsHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+// streamHandler はReactからの接続を受け付け、監視結果を流し続けます
+func streamHandler(w http.ResponseWriter, r *http.Request) {
+	// SSE用のヘッダー: 「これは途切れないデータのストリームですよ」とブラウザに伝える
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
 
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusOK)
+	ch := subscribe()
+	defer unsubscribe(ch)
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("クライアントが切断されました")
+			return
+		case res := <-ch:
+			data, _ := json.Marshal(res)
+			fmt.Fprintf(w, "data: %s\n\n", string(data))
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+	}
+}
+
+// 初回レンダリング用: 現在の全URLの状態を返す
+func statusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	statuses := monitor.GetAllStatus()
+	results := make([]Result, len(statuses))
+	for i, s := range statuses {
+		results[i] = Result{
+			URL:          s.URL,
+			Status:       s.LastStatus,
+			Latency:      s.LastLatency,
+			ErrorMessage: s.LastError,
+			CheckedAt:    s.LastCheck,
+		}
+	}
+	json.NewEncoder(w).Encode(results)
+}
+
+// historyHandler: グラフ用に履歴返す
+func historyHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	url := r.URL.Query().Get("url")
+	if url == "" {
+		http.Error(w, "url required", http.StatusBadRequest)
 		return
 	}
 
+	var histories []CheckHistory
+	// 直近24時間分のデータを返す
+	since := time.Now().Add(-24 * time.Hour).Unix()
+	db.Where("url = ? AND checked_at >= ?", url, since).Order("checked_at asc").Find(&histories)
+	json.NewEncoder(w).Encode(histories)
+}
+
+func urlsHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		var payload struct {
@@ -259,13 +337,17 @@ func urlsHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "url is required", http.StatusBadRequest)
 			return
 		}
-		monitor.Add(payload.URL)
+
+		if err := monitor.Add(payload.URL); err != nil {
+			http.Error(w, "URL追加失敗: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 		fmt.Println("URLを追加しました:", payload.URL)
 
 		// 追加: 即座に1回チェックしてbroadcastする
 		go func(url string) {
 			res := checkStatus(url)
-			handleResult(res)
+			monitor.UpdateResult(res)
 			broadcast(res)
 		}(payload.URL)
 
@@ -277,148 +359,14 @@ func urlsHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "url query param is required", http.StatusBadRequest)
 			return
 		}
-		monitor.Remove(url)
+		if err := monitor.Remove(url); err != nil {
+			http.Error(w, "URL削除失敗: "+err.Error(), http.StatusInternalServerError)
+		}
 		fmt.Println("URLを削除しました:", url)
 		w.WriteHeader(http.StatusOK)
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-// 初回レンダリング用: 現在の全URLの状態を返す
-func statusHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Content-Type", "application/json")
-
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	urls := monitor.GetURLs()
-
-	// 今はまだチェック結果が無いので、ダミーデータを返す
-	dummy := make([]Result, 0, len(urls))
-	for _, u := range urls {
-		dummy = append(dummy, Result{
-			URL:     u,
-			Status:  0, // 0 = 未チェック扱い
-			Latency: 0,
-		})
-	}
-
-	if err := json.NewEncoder(w).Encode(dummy); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-}
-
-// streamHandler はReactからの接続を受け付け、監視結果を流し続けます
-func streamHandler(w http.ResponseWriter, r *http.Request) {
-	// 1. CORS対応: React(別ポート)からのアクセスを許可する
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	// 2. SSE用のヘッダー: 「これは途切れないデータのストリームですよ」とブラウザに伝える
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
-	// 5秒ごとに動く時計（Ticker）を作成
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	// クライアント（ブラウザ）がタブを閉じたことを検知するための仕組み
-	ctx := r.Context()
-
-	fmt.Println("クライアントが接続しました。監視を開始します...")
-
-	// 無限ループで定期的に処理を行う
-	for {
-		select {
-		case <-ctx.Done(): // ブラウザが閉じられたらループを抜ける
-			fmt.Println("クライアントが切断されました")
-			return
-		case <-ticker.C: // 5秒経過するごとにここが実行される
-			// 毎回最新のリストを取得する
-			urls := monitor.GetURLs()
-			numJobs := len(urls)
-			if numJobs == 0 {
-				continue
-			}
-
-			// 1. チャネルの準備
-			jobs := make(chan string, numJobs)        // 仕事(URL)を入れる箱
-			resultsChan := make(chan Result, numJobs) // 結果を入れる箱
-
-			// 2. ワーカーを起動する
-			const workerCount = 3
-			var wg sync.WaitGroup
-
-			for i := 0; i < workerCount; i++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					// jobsチャネルからURLが送られてくるのを待機し、届いたら処理する
-					for url := range jobs {
-						resultsChan <- checkStatus(url)
-					}
-				}()
-			}
-
-			// 3. 仕事（URL）をチャネルに投入する
-			for _, url := range urls {
-				jobs <- url
-			}
-			close(jobs) // 「もう仕事はないよ」とワーカーに伝える（これでrangeが終了する）
-
-			go func() {
-				wg.Wait()
-				close(resultsChan)
-			}()
-
-			// --- ここから下で、受け取った結果をフロントエンドに送信 ---
-			for res := range resultsChan {
-				// 1. 【ここを修正】何をもって「今回のチェックが失敗」とするか
-				// エラーメッセージがある、もしくはステータスコードが400以上（リダイレクト3xxは許容）
-				isCheckFailed := res.ErrorMessage != "" || (res.Status >= 400)
-
-				monitor.mu.Lock()
-				wasDown := monitor.isDown[res.URL]
-
-				if isCheckFailed {
-					// 失敗した場合：カウントを増やす
-					monitor.failCounts[res.URL]++
-					currentFailCount := monitor.failCounts[res.URL]
-
-					// 3回連続失敗して初めて「ダウン状態」とみなす
-					if currentFailCount >= 3 && !wasDown {
-						go sendDiscordNotification("🚨 【障害確定】 " + res.URL + " が3回連続で失敗しました。")
-						monitor.isDown[res.URL] = true
-					}
-				} else {
-					// 成功した場合（200 OK や 301 Redirect など）
-					if wasDown {
-						go sendDiscordNotification("✅ 【復旧】 " + res.URL + " が回復しました。")
-						monitor.isDown[res.URL] = false
-					}
-					// カウントをリセット
-					monitor.failCounts[res.URL] = 0
-				}
-				monitor.mu.Unlock()
-
-				// 構造体をJSON文字列に変換
-				data, _ := json.Marshal(res)
-
-				// SSEのフォーマットである "data: {JSON}\n\n" の形式で書き込む
-				fmt.Fprintf(w, "data: %s\n\n", string(data))
-
-				// バッファに溜め込まず、即座にフロントエンドに押し出す(Flush)
-				if flusher, ok := w.(http.Flusher); ok {
-					flusher.Flush()
-				}
-			}
-			fmt.Println("チェック完了。対象数:", len(urls))
-		}
 	}
 }
 
