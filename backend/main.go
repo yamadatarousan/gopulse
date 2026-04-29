@@ -18,9 +18,9 @@ import (
 type Result struct {
 	URL          string `json:"url"`
 	Status       int    `json:"status"`
-	Latency      int64  `json:"latency"`         // ミリ秒
-	ErrorMessage string `json:"error,omitempty"` // エラーがない時は省略される
-	CheckedAt    int64  `json:"checked_at"`      // 追加: いつの結果か分かるように
+	Latency      int64  `json:"latency"` // ミリ秒
+	ErrorMessage string `json:"error"`
+	CheckedAt    int64  `json:"checked_at"` // 追加: いつの結果か分かるように
 }
 
 // === DBモデル追加 ===
