@@ -76,8 +76,8 @@ function App() {
           checked_at: data.checked_at || Math.floor(Date.now() / 1000)
         };
 
-        // 既存の履歴に新しい点を追加。最大288点 = 24時間分 5秒間隔
-        const updatedHistory = [...(prevData?.history || []), newHistoryPoint].slice(-288);
+        // 288→720に増やす。1時間分を5秒間隔で保持
+        const updatedHistory = [...(prevData?.history || []), newHistoryPoint].slice(-720);
 
         const updated: ResultWithHistory = {
           ...data, // Resultのプロパティを展開

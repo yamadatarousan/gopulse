@@ -3,15 +3,20 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/joho/godotenv"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
+	"io"
+	"net"
 	"net/http"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/joho/godotenv"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 // Result フロントエンドにJSONとして送るため、タグ（`json:"..."`）を追加します
@@ -62,6 +67,9 @@ func initDB() {
 	}
 	// テーブル自動作成
 	db.AutoMigrate(&URLStatus{}, &CheckHistory{})
+
+	// インデックス追加: これが無いとフルスキャンになる
+	db.Exec("CREATE INDEX IF NOT EXISTS idx_check_histories_url_checked_at ON check_histories(url, checked_at)")
 
 	// 初回起動時にデフォルトURL入れる
 	var count int64
@@ -317,9 +325,13 @@ func historyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var histories []CheckHistory
-	// 直近24時間分のデータを返す
-	since := time.Now().Add(-24 * time.Hour).Unix()
-	db.Where("url = ? AND checked_at >= ?", url, since).Order("checked_at asc").Find(&histories)
+	// 直近1時間分だけ返す。288点→12点
+	since := time.Now().Add(-1 * time.Hour).Unix()
+	db.Where("url = ? AND checked_at >= ?", url, since).
+		Order("checked_at asc").
+		Limit(720). // 最大720点 = 1時間分
+		Find(&histories)
+
 	json.NewEncoder(w).Encode(histories)
 }
 
@@ -370,24 +382,70 @@ func urlsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// checkStatus は実際にHTTPリクエストを飛ばして結果を返す関数です
+// checkStatus: 間欠的タイムアウト対策版
 func checkStatus(url string) Result {
+	var lastErr error
+
+	// 最大2回リトライ
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			time.Sleep(500 * time.Microsecond)
+		}
+
+		res, err := doCheck(url)
+		if err == nil {
+			return res
+		}
+		lastErr = err
+
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			fmt.Printf("⚠️ タイムアウト %s: リトライ %d/2\n", url, attempt+1)
+			continue
+		}
+		break
+	}
+
+	return Result{
+		URL:          url,
+		Status:       -1,
+		Latency:      8000,
+		ErrorMessage: lastErr.Error(),
+		CheckedAt:    time.Now().Unix(),
+	}
+}
+
+func doCheck(url string) (Result, error) {
 	start := time.Now()
 
-	// タイムアウト設定付きのクライアント
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: -1, // KeepAlive無効
+		}).DialContext,
+		ForceAttemptHTTP2:     false, // HTTP2無効
+		DisableKeepAlives:     true,  // 接続使いまわし無効
+		MaxIdleConns:          -1,
+		TLSHandshakeTimeout:   3 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second, // 3→5秒に緩和
+		TLSClientConfig:       &tls.Config{},
+	}
+
 	client := http.Client{
-		Timeout: 10 * time.Second, // 余裕を持たせる,
+		Transport: transport,
+		Timeout:   10 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
+			if len(via) >= 5 {
 				return fmt.Errorf("リダイレクトが多すぎます")
 			}
 			return nil
 		},
 	}
 
-	// 1. リクエストオブジェクトを作成
 	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("User-Agent", "GoPulse/1.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0") // 本物ブラウザに偽装
+	req.Close = true                            // 接続を閉じる指示
 
 	resp, err := client.Do(req)
 	elapsed := time.Since(start).Milliseconds()
@@ -396,19 +454,19 @@ func checkStatus(url string) Result {
 		URL:       url,
 		Latency:   elapsed,
 		CheckedAt: time.Now().Unix(),
-		Status:    0, // デフォルト
+		Status:    0,
 	}
 
 	if err != nil {
-		// ここでエラー内容を詳しくログに出すと原因がわかります
-		fmt.Printf("❌ ネットワークエラー: %v\n", err)
-		res.ErrorMessage = err.Error()
-		res.Status = -1 // エラー時は-1にする。0と区別
-		return res
+		return res, err
 	}
 	defer resp.Body.Close()
+
+	// Bodyは読まずに捨てる。ヘッダーだけみればOK
+	io.Copy(io.Discard, resp.Body)
+
 	res.Status = resp.StatusCode
-	return res
+	return res, nil
 }
 
 func sendDiscordNotification(message string) {
