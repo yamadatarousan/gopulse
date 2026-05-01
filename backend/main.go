@@ -61,7 +61,7 @@ var monitor = &Monitor{}
 // DB初期化
 func initDB() {
 	var err error
-	db, err = gorm.Open(sqlite.Open("gopulse.db"), &gorm.Config{})
+	db, err = gorm.Open(sqlite.Open("gopulse.db?_journal_mode=WAL&_busy_timeout=5000"), &gorm.Config{})
 	if err != nil {
 		panic("failed to connect database")
 	}
@@ -112,7 +112,9 @@ func (m *Monitor) GetAllStatus() []URLStatus {
 // チェック結果を更新
 func (m *Monitor) UpdateResult(res Result) {
 	var status URLStatus
-	db.Where("url =?", res.URL).First(&status)
+	if err := db.Where("url = ?", res.URL).First(&status).Error; err != nil {
+		return // 削除済み
+	}
 
 	wasDown := status.IsDown
 	isFailed := res.ErrorMessage != "" || (res.Status >= 400)
@@ -389,7 +391,7 @@ func checkStatus(url string) Result {
 	// 最大2回リトライ
 	for attempt := 0; attempt < 2; attempt++ {
 		if attempt > 0 {
-			time.Sleep(500 * time.Microsecond)
+			time.Sleep(500 * time.Millisecond) // 少し待ってからリトライ
 		}
 
 		res, err := doCheck(url)
