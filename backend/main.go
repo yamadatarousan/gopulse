@@ -65,6 +65,11 @@ func initDB() {
 	if err != nil {
 		panic("failed to connect database")
 	}
+
+	var mode string
+	db.Raw("PRAGMA journal_mode").Scan(&mode)
+	fmt.Println("SQLite Journal Mode:", mode) // walって出ればOK
+
 	// テーブル自動作成
 	db.AutoMigrate(&URLStatus{}, &CheckHistory{})
 
@@ -111,6 +116,8 @@ func (m *Monitor) GetAllStatus() []URLStatus {
 
 // チェック結果を更新
 func (m *Monitor) UpdateResult(res Result) {
+	start := time.Now()
+
 	var status URLStatus
 	if err := db.Where("url = ?", res.URL).First(&status).Error; err != nil {
 		return // 削除済み
@@ -147,6 +154,8 @@ func (m *Monitor) UpdateResult(res Result) {
 		ErrorMsg:  res.ErrorMessage,
 		CheckedAt: res.CheckedAt,
 	})
+
+	fmt.Printf("DB書き込み: %dms\n", time.Since(start).Milliseconds())
 }
 
 // CORSミドルウェア
